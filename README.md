@@ -130,6 +130,8 @@ two round trips (read, then a generation-checked write).
 ## See Also:
 
 * [mongodb-charglt](https://github.com/srmadscience/mongodb-charglt)
+* [oracle-charglt](https://github.com/srmadscience/oracle-charglt)
+* [postgres-charglt](https://github.com/srmadscience/postgres-charglt)
 * [redis-charglt](https://github.com/srmadscience/redis-charglt)
 * [s2-charglt](https://github.com/srmadscience/s2-charglt)
 * [voltdb-charglt](https://github.com/srmadscience/voltdb-charglt)

@@ -34,9 +34,10 @@ public class UserTransactionState {
     public long sessionId = Long.MIN_VALUE;
 
     /**
-     * When a transaction started, or zero if there isn't one.
+     * When a transaction started, or zero if there isn't one. Volatile because the async client's
+     * event loop threads end transactions while the sending thread checks for them.
      */
-    public long txStartMs = 0;
+    public volatile long txStartMs = 0;
 
     /**
      * Balance. Long.MAX_VALUE means we don't know...

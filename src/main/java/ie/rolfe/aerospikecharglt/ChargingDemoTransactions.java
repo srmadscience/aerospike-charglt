@@ -30,8 +30,8 @@ public class ChargingDemoTransactions extends BaseChargingDemo {
 
         msg("Parameters:" + Arrays.toString(args));
 
-        if (args.length != 5 && args.length != 6) {
-            msg("Usage: hostnames recordcount tpms durationseconds queryseconds [threads]");
+        if (args.length != 5) {
+            msg("Usage: hostnames recordcount tpms durationseconds queryseconds");
             System.exit(1);
         }
 
@@ -43,9 +43,6 @@ public class ChargingDemoTransactions extends BaseChargingDemo {
 
         // Target transactions per millisecond.
         int tpMs = Integer.parseInt(args[2]);
-
-        // How many threads. Defaults to the number of CPUs.
-        int threadCount = getThreadCount(args, 5);
 
         // Runtime for TRANSACTIONS in seconds.
         int durationSeconds = Integer.parseInt(args[3]);
@@ -62,7 +59,7 @@ public class ChargingDemoTransactions extends BaseChargingDemo {
             try (IAerospikeClient aerospikeClient = connect(hostlist)) {
                 clearUnfinishedTransactions(aerospikeClient);
 
-                 ok = runTransactionBenchmark(userCount, tpMs, durationSeconds, globalQueryFreqSeconds, aerospikeClient, extraMs, threadCount);
+                 ok = runTransactionBenchmark(userCount, tpMs, durationSeconds, globalQueryFreqSeconds, aerospikeClient, extraMs);
             }
             msg("Closing connection...");
 

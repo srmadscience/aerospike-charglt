@@ -37,8 +37,8 @@ public class CreateChargingDemoData extends BaseChargingDemo {
 
         msg("Parameters:" + Arrays.toString(args));
 
-        if (args.length != 4 && args.length != 5) {
-            msg("Usage: hostnames recordcount tpms  maxinitialcredit [threads]");
+        if (args.length != 4) {
+            msg("Usage: hostnames recordcount tpms  maxinitialcredit");
             System.exit(1);
         }
 
@@ -50,9 +50,6 @@ public class CreateChargingDemoData extends BaseChargingDemo {
 
         // Target transactions per millisecond.
         int tpMs = Integer.parseInt(args[2]);
-
-        // How many threads. Defaults to the number of CPUs.
-        int threadCount = getThreadCount(args, 4);
 
         // How long our arbitrary JSON payload will be.
         int loblength = 120;
@@ -67,7 +64,7 @@ public class CreateChargingDemoData extends BaseChargingDemo {
 
             try (IAerospikeClient aerospikeClient = connect(hostlist)) {
                 msg("Connected to " + aerospikeClient.getNodes().length + " node(s)");
-                upsertAllUsers(userCount, tpMs, ourJson, initialCredit, aerospikeClient, threadCount, getExtraMsIfSet());
+                upsertAllUsers(userCount, tpMs, ourJson, initialCredit, aerospikeClient, getExtraMsIfSet());
             }
             msg("Closing connection...");
 

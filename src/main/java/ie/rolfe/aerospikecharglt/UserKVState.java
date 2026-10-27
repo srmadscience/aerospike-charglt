@@ -43,9 +43,10 @@ public class UserKVState {
     int userState = STATUS_UNLOCKED;
 
     /**
-     * When a transaction started, or zero if there isn't one.
+     * When a transaction started, or zero if there isn't one. Volatile because the async client's
+     * event loop threads end transactions while the sending thread checks for them.
      */
-    long txStartMicros = 0;
+    volatile long txStartMicros = 0;
 
     /**
      * Last time record was known to be locked by someone else...
@@ -94,54 +95,6 @@ public class UserKVState {
     public int getUserStatus() {
         return userState;
     }
-//TODO
-//    @Override
-//    public void clientCallback(ClientResponse arg0) throws Exception {
-//
-//        if (arg0.getStatus() == ClientResponse.SUCCESS) {
-//
-//            byte statusByte = arg0.getAppStatus();
-//
-//            if (userState == STATUS_UNLOCKED) {
-//                BaseChargingDemo.msg("UserKVState.clientCallback: got app status of " + arg0.getAppStatusString());
-//            } else if (userState == STATUS_TRYING_TO_LOCK) {
-//
-//                shc.reportLatencyMicros(BaseChargingDemo.KV_GET, txStartMicros, BaseChargingDemo.KV_GET,
-//                        BaseChargingDemo.HISTOGRAM_SIZE_MS, 1);
-//
-//                if (statusByte == ReferenceData.STATUS_RECORD_HAS_BEEN_SOFTLOCKED) {
-//
-//                    userState = STATUS_LOCKED;
-//                    lockId = arg0.getAppStatusString();
-//
-//                } else if (statusByte == ReferenceData.STATUS_RECORD_ALREADY_SOFTLOCKED) {
-//
-//                    userState = STATUS_LOCKED_BY_SOMEONE_ELSE;
-//                    lockId = "";
-//                    lockedBySomeoneElseCount++;
-//                    otherLockTimeMs = System.currentTimeMillis();
-//
-//                } else {
-//                    userState = STATUS_UNLOCKED;
-//                }
-//            } else if (userState == STATUS_UPDATING) {
-//
-//                shc.reportLatencyMicros(BaseChargingDemo.KV_PUT, txStartMicros, BaseChargingDemo.KV_PUT,
-//                        BaseChargingDemo.HISTOGRAM_SIZE_MS, 1);
-//
-//                lockId = "";
-//                userState = STATUS_UNLOCKED;
-//
-//            }
-//
-//        } else {
-//            BaseChargingDemo.msg("UserKVState.clientCallback: got status of " + arg0.getStatusString());
-//        }
-//
-//        // End transaction
-//        txStartMicros = 0;
-//    }
-
     /**
      * @return the lockId
      */
@@ -157,7 +110,6 @@ public class UserKVState {
 
         if (lockId == Long.MIN_VALUE) {
             userState = STATUS_UNLOCKED;
-            txStartMicros = 0;
         } else {
             userState = STATUS_LOCKED;
         }

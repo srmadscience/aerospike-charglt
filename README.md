@@ -21,9 +21,9 @@ Each user is one record in `test.charglt_users`, keyed by user id:
 | `usage` | string | JSON of reservations by session |
 | `txns` | string | JSON of recent transactions, used for idempotency |
 
-* **Transactions** (`AddCredit`, `ReportQuotaUsage`) read the record, apply the business logic in
-  `UserTable`, and write it back with a generation check (`EXPECT_GEN_EQUAL`), retrying if someone else
-  changed the record in the meantime.
+* **Transactions** (`AddCredit`, `ReportQuotaUsage`) do an async read of the record, apply the business
+  logic in `UserTable`, and do an async write back with a generation check (`EXPECT_GEN_EQUAL`), retrying
+  if someone else changed the record in the meantime.
 * **KV store** lock and update are each a single `operate()` call with a filter expression, so the
   "is it locked?" check and the write are atomic. Delta updates change one key in the `userData` map
   server side instead of sending the whole payload.
@@ -43,10 +43,10 @@ Then, using `target/aerospike-charglt-1.0-SNAPSHOT-jar-with-dependencies.jar` as
 
 | Class | Parameters |
 |---|---|
-| `ie.rolfe.aerospikecharglt.CreateChargingDemoData` | hostnames recordcount tpms maxinitialcredit [threads] |
-| `ie.rolfe.aerospikecharglt.ChargingDemoTransactions` | hostnames recordcount tpms durationseconds queryseconds [threads] |
-| `ie.rolfe.aerospikecharglt.ChargingDemoKVStore` | hostnames recordcount tpms durationseconds queryseconds jsonsize deltaProportion [threads] |
-| `ie.rolfe.aerospikecharglt.DeleteChargingDemoData` | hostnames recordcount tpms [threads] |
+| `ie.rolfe.aerospikecharglt.CreateChargingDemoData` | hostnames recordcount tpms maxinitialcredit |
+| `ie.rolfe.aerospikecharglt.ChargingDemoTransactions` | hostnames recordcount tpms durationseconds queryseconds |
+| `ie.rolfe.aerospikecharglt.ChargingDemoKVStore` | hostnames recordcount tpms durationseconds queryseconds jsonsize deltaProportion |
+| `ie.rolfe.aerospikecharglt.DeleteChargingDemoData` | hostnames recordcount tpms |
 
 e.g.
 
@@ -56,10 +56,11 @@ e.g.
     java -cp $J ie.rolfe.aerospikecharglt.ChargingDemoKVStore localhost 100000 5 60 10 100 50
     java -cp $J ie.rolfe.aerospikecharglt.DeleteChargingDemoData localhost 100000 200
 
-`threads` defaults to the number of CPUs. Each thread owns the users where `id % threads == threadId`
-and gets an equal share of `tpms`, so threads never contend for the same user and share one
-thread-safe `AerospikeClient`. You can't have more threads than `tpms`, and the per-user soft locks and
-generation checks still protect against other client processes running at the same time.
+The benchmarks use the Aerospike async client. A single thread sends requests at `tpms`, and responses
+arrive on one event loop per CPU, which update each user's client-side state. A user with a request
+outstanding is skipped until it finishes, and at the end the benchmark waits for everything outstanding
+to finish. Each event loop has at most `MAX_COMMANDS_PER_LOOP` requests on the wire, default 8, minimum 5.
+Raising it past what the server can handle adds queueing latency without adding throughput.
 
 `hostnames` is a comma delimited list of `host[:port]`; the port defaults to 3000. Set `AEROSPIKE_NAMESPACE`
 to use a namespace other than `test`, and `EXTRA_MS` to slow things down on very slow hardware.
@@ -74,7 +75,6 @@ to use a namespace other than `test`, and `EXTRA_MS` to slow things down on very
 ## TODO
 
 * Feed to downstream systems
-* Use the async client instead of sync calls on many threads
 
 ## Status
 

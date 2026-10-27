@@ -32,8 +32,8 @@ public class ChargingDemoKVStore extends BaseChargingDemo {
 
         msg("Parameters:" + Arrays.toString(args));
 
-        if (args.length != 7) {
-            msg("Usage: hostnames recordcount tpms durationseconds queryseconds jsonsize deltaProportion");
+        if (args.length != 7 && args.length != 8) {
+            msg("Usage: hostnames recordcount tpms durationseconds queryseconds jsonsize deltaProportion [threads]");
             System.exit(1);
         }
 
@@ -44,6 +44,9 @@ public class ChargingDemoKVStore extends BaseChargingDemo {
 
         // Target transactions per millisecond.
         int tpMs = Integer.parseInt(args[2]);
+
+        // How many threads. Defaults to the number of CPUs.
+        int threadCount = getThreadCount(args, 7);
 
         // Runtime for TRANSACTIONS in seconds.
         int durationSeconds = Integer.parseInt(args[3]);
@@ -64,7 +67,7 @@ public class ChargingDemoKVStore extends BaseChargingDemo {
             try (IAerospikeClient aerospikeClient = connect(hostlist)) {
                 unlockAllRecords(aerospikeClient);
                  ok = runKVBenchmark(userCount, tpMs, durationSeconds, globalQueryFreqSeconds, jsonsize, aerospikeClient,
-                        deltaProportion, extraMs);
+                        deltaProportion, extraMs, threadCount);
             }
 
 

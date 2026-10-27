@@ -51,6 +51,15 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.IntFunction;
 import java.util.function.Predicate;
 
 /**
@@ -143,60 +152,61 @@ public abstract class BaseChargingDemo {
     }
 
 
-    protected static void upsertAllUsers(int userCount, int tpMs, ExtraUserData ourEud, int initialCredit, IAerospikeClient aerospikeClient)
+    protected static void upsertAllUsers(int userCount, int tpMs, ExtraUserData ourEud, int initialCredit,
+                                         IAerospikeClient aerospikeClient, int threadCount, int extraMs)
             throws InterruptedException {
 
         final long startMsUpsert = System.currentTimeMillis();
-
-        SafeHistogramCache shc = SafeHistogramCache.getInstance();
-        long currentMs = System.currentTimeMillis();
-        int tpThisMs = 0;
-        Random r = new Random();
-        Gson g = new Gson();
+        final int usableThreadCount = getUsableThreadCount(threadCount, tpMs, userCount);
+        final AtomicLong upsertCount = new AtomicLong();
 
         WritePolicy upsertPolicy = new WritePolicy(aerospikeClient.getWritePolicyDefault());
         upsertPolicy.recordExistsAction = RecordExistsAction.REPLACE;
 
-        for (int i = 0; i < userCount; i++) {
+        msg("Upserting " + userCount + " users using " + usableThreadCount + " threads");
 
-            if (tpThisMs++ > tpMs) {
+        runInThreads(usableThreadCount, threadId -> () -> {
 
-                while (currentMs == System.currentTimeMillis()) {
-                    Thread.sleep(0, 50000);
+            TpMsThrottle throttle = new TpMsThrottle(getThreadTpMs(tpMs, usableThreadCount, threadId), extraMs);
+            Random r = new Random();
+
+            for (int i = threadId; i < userCount; i += usableThreadCount) {
+
+                throttle.await();
+
+                UserTable newUser = UserTable.getUserTable(ourEud, r.nextInt(initialCredit), i, startMsUpsert);
+                newUser.addCredit(100, "Txn_" + i);
+                newUser.reportQuotaUsage(100, 10, 100, "TX2_" + i);
+
+                final long startMs = System.currentTimeMillis();
+
+                try {
+                    aerospikeClient.put(upsertPolicy, getKey(i), newUser.toBins());
+                    shc.reportLatency(BaseChargingDemo.ADD_DOC, startMs, "Add time", 2000);
+                    shc.incCounter(BaseChargingDemo.ADD_DOC);
+                } catch (AerospikeException e) {
+                    msg("Upsert of user " + i + " failed: " + e.getMessage());
+                    shc.incCounter(BaseChargingDemo.ADD_DOC_ERROR);
                 }
 
-                currentMs = System.currentTimeMillis();
-                tpThisMs = 0;
-            }
+                long upserted = upsertCount.incrementAndGet();
 
-            UserTable newUser = UserTable.getUserTable(ourEud, r.nextInt(initialCredit), i, startMsUpsert);
-            newUser.addCredit(100, "Txn_" + i);
-            newUser.reportQuotaUsage(100, 10, 100, "TX2_" + i);
+                if (upserted % 100000 == 1) {
+                    msg("Upserted " + upserted + " users...");
 
-            final long startMs = System.currentTimeMillis();
+                    if (shc.getCounter(BaseChargingDemo.ADD_DOC_ERROR) > 0) {
+                        msg("Errors detected. Halting...");
+                        break;
+                    } else if (threadId == 0) {
+                        queryUserAndStats(aerospikeClient, i);
+                    }
 
-            try {
-                aerospikeClient.put(upsertPolicy, getKey(i), newUser.toBins());
-                shc.reportLatency(BaseChargingDemo.ADD_DOC, startMs, "Add time", 2000);
-                shc.incCounter(BaseChargingDemo.ADD_DOC);
-            } catch (AerospikeException e) {
-                msg("Upsert of user " + i + " failed: " + e.getMessage());
-                shc.incCounter(BaseChargingDemo.ADD_DOC_ERROR);
-            }
-
-            if (i % 100000 == 1) {
-                msg("Upserted " + i + " users...");
-
-                if (shc.getCounter(BaseChargingDemo.ADD_DOC_ERROR) > 0) {
-                    msg("Errors detected. Halting...");
-                    break;
-                } else {
-                    queryUserAndStats(g, aerospikeClient, i);
                 }
 
             }
 
-        }
+            return null;
+        });
 
 
         long entriesPerMS = userCount / Math.max(1, System.currentTimeMillis() - startMsUpsert);
@@ -224,45 +234,41 @@ public abstract class BaseChargingDemo {
     }
 
 
-    protected static void deleteAllUsers(IAerospikeClient aerospikeClient, int userCount, int tpMs) {
+    protected static void deleteAllUsers(IAerospikeClient aerospikeClient, int userCount, int tpMs, int threadCount,
+                                         int extraMs) throws InterruptedException {
 
         final long startMsUpsert = System.currentTimeMillis();
+        final int usableThreadCount = getUsableThreadCount(threadCount, tpMs, userCount);
+        final AtomicLong deleteCount = new AtomicLong();
 
-        SafeHistogramCache shc = SafeHistogramCache.getInstance();
-        long currentMs = System.currentTimeMillis();
-        int tpThisMs = 0;
+        msg("Deleting " + userCount + " users using " + usableThreadCount + " threads");
 
+        runInThreads(usableThreadCount, threadId -> () -> {
 
-        for (int i = 0; i < userCount; i++) {
+            TpMsThrottle throttle = new TpMsThrottle(getThreadTpMs(tpMs, usableThreadCount, threadId), extraMs);
 
-            if (tpThisMs++ > tpMs) {
+            for (int i = threadId; i < userCount; i += usableThreadCount) {
 
-                while (currentMs == System.currentTimeMillis()) {
-                    try {
-                        Thread.sleep(0, 50000);
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
+                throttle.await();
+
+                long startNs = System.currentTimeMillis();
+                boolean existed = aerospikeClient.delete(null, getKey(i));
+                shc.reportLatency(BaseChargingDemo.DELETE_DOC, startNs, "Delete time", 2000);
+                if (existed) {
+                    shc.incCounter(BaseChargingDemo.DELETE_DOC);
+                } else {
+                    shc.incCounter(BaseChargingDemo.DELETE_DOC_ERROR);
                 }
 
-                currentMs = System.currentTimeMillis();
-                tpThisMs = 0;
+                long deleted = deleteCount.incrementAndGet();
+                if (deleted % 100000 == 1) {
+                    msg("Deleted " + deleted + " users...");
+                }
+
             }
 
-            long startNs = System.currentTimeMillis();
-            boolean existed = aerospikeClient.delete(null, getKey(i));
-            shc.reportLatency(BaseChargingDemo.DELETE_DOC, startNs, "Delete time", 2000);
-            if (existed) {
-                shc.incCounter(BaseChargingDemo.DELETE_DOC);
-            } else {
-                shc.incCounter(BaseChargingDemo.DELETE_DOC_ERROR);
-            }
-
-            if (i % 100000 == 1) {
-                msg("Deleted " + i + " users...");
-            }
-
-        }
+            return null;
+        });
 
         long entriesPerMS = userCount / Math.max(1, System.currentTimeMillis() - startMsUpsert);
         msg("Deleted " + entriesPerMS + " users per ms...");
@@ -273,7 +279,7 @@ public abstract class BaseChargingDemo {
     /**
      * Convenience method to query a user a general stats and log the results
      */
-    protected static void queryUserAndStats(Gson g, IAerospikeClient aerospikeClient, int queryUserId) {
+    protected static void queryUserAndStats(IAerospikeClient aerospikeClient, int queryUserId) {
 
         // Query user #queryUserId...
         msg("Query user #" + queryUserId + "...");
@@ -386,148 +392,52 @@ public abstract class BaseChargingDemo {
      * @param mainClient
      * @param deltaProportion
      * @param extraMs
+     * @param threadCount            how many threads to spread the work over
      * @return true if >=90% of requested throughput was achieved.
      * @throws InterruptedException
      */
     protected static boolean runKVBenchmark(int userCount, int tpMs, int durationSeconds, int globalQueryFreqSeconds,
-                                            int jsonsize, IAerospikeClient mainClient, int deltaProportion, int extraMs)
+                                            int jsonsize, IAerospikeClient mainClient, int deltaProportion, int extraMs,
+                                            int threadCount)
             throws InterruptedException {
 
-        long lastGlobalQueryMs = 0;
-
-        UserKVState[] userState = new UserKVState[userCount];
-
-        Random r = new Random();
-        Gson gson = new Gson();
-
-        for (int i = 0; i < userCount; i++) {
-            userState[i] = new UserKVState(i, shc);
-        }
+        final int usableThreadCount = getUsableThreadCount(threadCount, tpMs, userCount);
+        final AtomicLong progressCount = new AtomicLong();
 
         final long startMsRun = System.currentTimeMillis();
-        long currentMs = System.currentTimeMillis();
-        int tpThisMs = 0;
-
         final long endtimeMs = System.currentTimeMillis() + (durationSeconds * 1000L);
 
-        // How many transactions we've done...
-        int tranCount = 0;
-        int inFlightCount = 0;
-        int lockCount = 0;
-        int contestedLockCount = 0;
-        int fullUpdate = 0;
-        int deltaUpdate = 0;
+        msg("Running KV benchmark for " + userCount + " users using " + usableThreadCount + " threads");
 
-        int firstSession = Integer.MIN_VALUE;
+        // Keep an eye on one user while we run...
+        final int watchedUser = new Random().nextInt(userCount);
+        ScheduledExecutorService globalQueries = startGlobalQueries(mainClient, watchedUser, globalQueryFreqSeconds);
 
-        while (endtimeMs > System.currentTimeMillis()) {
+        KVResults results = new KVResults();
 
-            if (tpThisMs++ > tpMs) {
-
-                while (currentMs == System.currentTimeMillis()) {
-                    Thread.sleep(0, 50000);
-
-                }
-
-                sleepExtraMSIfNeeded(extraMs);
-
-                currentMs = System.currentTimeMillis();
-                tpThisMs = 0;
+        try {
+            for (KVResults threadResults : runInThreads(usableThreadCount, threadId -> () ->
+                    runKVWorker(threadId, usableThreadCount, userCount, tpMs, endtimeMs, jsonsize, mainClient,
+                            deltaProportion, extraMs, progressCount))) {
+                results.add(threadResults);
             }
-
-            // Find session to do a transaction for...
-            int oursession = r.nextInt(userCount);
-
-            if (firstSession == Integer.MIN_VALUE) {
-                firstSession = oursession;
-            }
-
-            // See if session already has an active transaction and avoid
-            // it if it does.
-            if (userState[oursession].isTxInFlight()) {
-
-                inFlightCount++;
-
-            } else if (userState[oursession].getUserStatus() == UserKVState.STATUS_LOCKED_BY_SOMEONE_ELSE) {
-
-                if (userState[oursession].getOtherLockTimeMs() + ReferenceData.LOCK_TIMEOUT_MS < System
-                        .currentTimeMillis()) {
-
-                    userState[oursession].startTran();
-                    userState[oursession].setStatus(UserKVState.STATUS_TRYING_TO_LOCK);
-                    GetAndLockUser(mainClient, userState[oursession], oursession);
-                    lockCount++;
-
-                } else {
-                    contestedLockCount++;
-                }
-
-            } else if (userState[oursession].getUserStatus() == UserKVState.STATUS_UNLOCKED) {
-
-                userState[oursession].startTran();
-                userState[oursession].setStatus(UserKVState.STATUS_TRYING_TO_LOCK);
-                GetAndLockUser(mainClient, userState[oursession], oursession);
-                lockCount++;
-
-            } else if (userState[oursession].getUserStatus() == UserKVState.STATUS_LOCKED) {
-
-                userState[oursession].startTran();
-                userState[oursession].setStatus(UserKVState.STATUS_UPDATING);
-
-                if (deltaProportion > r.nextInt(101)) {
-                    deltaUpdate++;
-                    // Instead of sending entire JSON object across wire ask Aerospike to update loyalty
-                    // number inside the userData map bin. For large values this can have a dramatic
-                    // effect on network bandwidth
-                    UpdateLockedUser(mainClient, userState[oursession],
-                            userState[oursession].getLockId(), oursession, getNewLoyaltyCardNumber(r) + "",
-                            ExtraUserData.NEW_LOYALTY_NUMBER);
-                } else {
-                    fullUpdate++;
-                    UpdateLockedUser(mainClient, userState[oursession],
-                            userState[oursession].getLockId(), oursession, getExtraUserDataAsObject(jsonsize, gson, r), null);
-                }
-
-            }
-
-            tranCount++;
-            userState[oursession].endTran(); //TODO - Fix when we make async
-
-            if (tranCount % 100000 == 1) {
-                msg("Transaction " + tranCount);
-            }
-
-            // See if we need to do global queries...
-            if (lastGlobalQueryMs + (globalQueryFreqSeconds * 1000L) < System.currentTimeMillis()) {
-                lastGlobalQueryMs = System.currentTimeMillis();
-
-                queryUserAndStats(gson, mainClient, firstSession);
-
-            }
-
+        } finally {
+            globalQueries.shutdownNow();
         }
 
+        msg(results.tranCount + " transactions done...");
 
-        msg(tranCount + " transactions done...");
-        msg("All entries in queue, waiting for it to drain...");
-        msg("Queue drained...");
-
-        long transactionsPerMs = tranCount / Math.max(1, System.currentTimeMillis() - startMsRun);
+        long transactionsPerMs = results.tranCount / Math.max(1, System.currentTimeMillis() - startMsRun);
         msg("processed " + transactionsPerMs + " entries per ms while doing transactions...");
 
-        long lockFailCount = 0;
-        for (int i = 0; i < userCount; i++) {
-            lockFailCount += userState[i].getLockedBySomeoneElseCount();
-        }
+        msg(results.inFlightCount + " events where a tx was in flight were observed");
+        msg(results.lockCount + " lock attempts");
+        msg(results.contestedLockCount + " contested lock attempts");
+        msg(results.lockFailCount + " lock attempt failures");
+        msg(results.fullUpdate + " full updates");
+        msg(results.deltaUpdate + " delta updates");
 
-        msg(inFlightCount + " events where a tx was in flight were observed");
-        msg(lockCount + " lock attempts");
-        msg(contestedLockCount + " contested lock attempts");
-        msg(lockFailCount + " lock attempt failures");
-        msg(fullUpdate + " full updates");
-        msg(deltaUpdate + " delta updates");
-
-        double tps = tranCount;
+        double tps = results.tranCount;
         tps = tps / (System.currentTimeMillis() - startMsRun);
         tps = tps * 1000;
 
@@ -535,6 +445,98 @@ public abstract class BaseChargingDemo {
 
         // Declare victory if we got >= 90% of requested TPS...
         return tps / (tpMs * 1000) > .9;
+    }
+
+    /**
+     * One thread's share of the KV benchmark. It owns every user whose id % threadCount == threadId,
+     * so no other thread in this process touches its users.
+     */
+    private static KVResults runKVWorker(int threadId, int threadCount, int userCount, int tpMs, long endtimeMs,
+                                         int jsonsize, IAerospikeClient mainClient, int deltaProportion, int extraMs,
+                                         AtomicLong progressCount)
+            throws InterruptedException {
+
+        UserKVState[] userState = new UserKVState[getThreadUserCount(userCount, threadCount, threadId)];
+
+        for (int i = 0; i < userState.length; i++) {
+            userState[i] = new UserKVState(i * threadCount + threadId, shc);
+        }
+
+        Random r = new Random();
+        Gson gson = new Gson();
+        TpMsThrottle throttle = new TpMsThrottle(getThreadTpMs(tpMs, threadCount, threadId), extraMs);
+        KVResults results = new KVResults();
+
+        while (endtimeMs > System.currentTimeMillis()) {
+
+            throttle.await();
+
+            // Find session to do a transaction for...
+            UserKVState ourState = userState[r.nextInt(userState.length)];
+            int oursession = ourState.id;
+
+            // See if session already has an active transaction and avoid
+            // it if it does.
+            if (ourState.isTxInFlight()) {
+
+                results.inFlightCount++;
+
+            } else if (ourState.getUserStatus() == UserKVState.STATUS_LOCKED_BY_SOMEONE_ELSE) {
+
+                if (ourState.getOtherLockTimeMs() + ReferenceData.LOCK_TIMEOUT_MS < System
+                        .currentTimeMillis()) {
+
+                    ourState.startTran();
+                    ourState.setStatus(UserKVState.STATUS_TRYING_TO_LOCK);
+                    GetAndLockUser(mainClient, ourState, oursession);
+                    results.lockCount++;
+
+                } else {
+                    results.contestedLockCount++;
+                }
+
+            } else if (ourState.getUserStatus() == UserKVState.STATUS_UNLOCKED) {
+
+                ourState.startTran();
+                ourState.setStatus(UserKVState.STATUS_TRYING_TO_LOCK);
+                GetAndLockUser(mainClient, ourState, oursession);
+                results.lockCount++;
+
+            } else if (ourState.getUserStatus() == UserKVState.STATUS_LOCKED) {
+
+                ourState.startTran();
+                ourState.setStatus(UserKVState.STATUS_UPDATING);
+
+                if (deltaProportion > r.nextInt(101)) {
+                    results.deltaUpdate++;
+                    // Instead of sending entire JSON object across wire ask Aerospike to update loyalty
+                    // number inside the userData map bin. For large values this can have a dramatic
+                    // effect on network bandwidth
+                    UpdateLockedUser(mainClient, ourState, ourState.getLockId(), oursession,
+                            getNewLoyaltyCardNumber(r) + "", ExtraUserData.NEW_LOYALTY_NUMBER);
+                } else {
+                    results.fullUpdate++;
+                    UpdateLockedUser(mainClient, ourState, ourState.getLockId(), oursession,
+                            getExtraUserDataAsObject(jsonsize, gson, r), null);
+                }
+
+            }
+
+            results.tranCount++;
+            ourState.endTran(); //TODO - Fix when we make async
+
+            long progress = progressCount.incrementAndGet();
+            if (progress % 100000 == 1) {
+                msg("Transaction " + progress);
+            }
+
+        }
+
+        for (UserKVState state : userState) {
+            results.lockFailCount += state.getLockedBySomeoneElseCount();
+        }
+
+        return results;
     }
 
     /**
@@ -625,19 +627,76 @@ public abstract class BaseChargingDemo {
     }
 
     /**
-     * Used when we need to really slow down below 1 tx per ms..
+     * Run one worker per thread and wait for them all to finish.
      *
-     * @param extraMs an arbitrary extra delay.
+     * @param threadCount     how many threads
+     * @param workerForThread given a thread id, returns the work for that thread
+     * @return each thread's result, in thread id order
      */
-    private static void sleepExtraMSIfNeeded(int extraMs) {
-        if (extraMs > 0) {
-            try {
-                Thread.sleep(extraMs);
-            } catch (InterruptedException e) {
-                e.printStackTrace();
-            }
-        }
+    protected static <T> List<T> runInThreads(int threadCount, IntFunction<Callable<T>> workerForThread)
+            throws InterruptedException {
 
+        ExecutorService pool = Executors.newFixedThreadPool(threadCount);
+
+        try {
+            List<Callable<T>> workers = new ArrayList<>(threadCount);
+            for (int threadId = 0; threadId < threadCount; threadId++) {
+                workers.add(workerForThread.apply(threadId));
+            }
+
+            List<T> results = new ArrayList<>(threadCount);
+            for (Future<T> future : pool.invokeAll(workers)) {
+                try {
+                    results.add(future.get());
+                } catch (ExecutionException e) {
+                    throw new RuntimeException(e.getCause());
+                }
+            }
+            return results;
+
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * Each thread needs at least one tx per ms and one user to work with.
+     */
+    protected static int getUsableThreadCount(int threadCount, int tpMs, int userCount) {
+        return Math.max(1, Math.min(threadCount, Math.min(tpMs, userCount)));
+    }
+
+    /**
+     * @return threadId's share of tpMs
+     */
+    private static int getThreadTpMs(int tpMs, int threadCount, int threadId) {
+        return tpMs / threadCount + (threadId < tpMs % threadCount ? 1 : 0);
+    }
+
+    /**
+     * @return how many users have id % threadCount == threadId
+     */
+    private static int getThreadUserCount(int userCount, int threadCount, int threadId) {
+        return (userCount - threadId + threadCount - 1) / threadCount;
+    }
+
+    /**
+     * Report on one user and global stats every freqSeconds, on a thread of its own so the
+     * workers aren't held up.
+     */
+    private static ScheduledExecutorService startGlobalQueries(IAerospikeClient aerospikeClient, int queryUserId,
+                                                               int freqSeconds) {
+
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleWithFixedDelay(() -> {
+            try {
+                queryUserAndStats(aerospikeClient, queryUserId);
+            } catch (Exception e) {
+                msg("Global query failed: " + e.getMessage());
+            }
+        }, freqSeconds, Math.max(1, freqSeconds), TimeUnit.SECONDS);
+
+        return scheduler;
     }
 
     /**
@@ -741,131 +800,173 @@ public abstract class BaseChargingDemo {
      * @param globalQueryFreqSeconds how often we check on global stats and a single
      *                               user
      * @param mainClient
+     * @param threadCount            how many threads to spread the work over
      * @return true if within 90% of targeted TPS
      * @throws InterruptedException
      */
     protected static boolean runTransactionBenchmark(int userCount, int tpMs, int durationSeconds,
-                                                     int globalQueryFreqSeconds, IAerospikeClient mainClient, int extraMs)
+                                                     int globalQueryFreqSeconds, IAerospikeClient mainClient, int extraMs,
+                                                     int threadCount)
             throws InterruptedException {
 
-        Gson g = new Gson();
-
-        // Used to track changes and be unique when we are running multiple threads
-        final long pid = getPid();
-
-        Random r = new Random();
-
-        UserTransactionState[] users = new UserTransactionState[userCount];
-
-        msg("Creating internal client records for " + users.length + " users");
-        for (int i = 0; i < users.length; i++) {
-            // We don't know a users credit till we've spoken to the server, so
-            // we make an optimistic assumption...
-            users[i] = new UserTransactionState(i, 2000);
-        }
+        final int usableThreadCount = getUsableThreadCount(threadCount, tpMs, userCount);
+        final AtomicLong progressCount = new AtomicLong();
 
         final long startMsRun = System.currentTimeMillis();
-        long currentMs = System.currentTimeMillis();
-        int tpThisMs = 0;
-
         final long endtimeMs = System.currentTimeMillis() + (durationSeconds * 1000L);
 
-        // How many transactions we've done...
-        long tranCount = 0;
-        long inFlightCount = 0;
-        long addCreditCount = 0;
-        long reportUsageCount = 0;
-        long lastGlobalQueryMs = System.currentTimeMillis();
+        msg("starting " + usableThreadCount + " threads for " + userCount + " users...");
 
-        msg("starting...");
+        ScheduledExecutorService globalQueries = startGlobalQueries(mainClient, (int) GENERIC_QUERY_USER_ID,
+                globalQueryFreqSeconds);
 
-        while (endtimeMs > System.currentTimeMillis()) {
+        TransactionResults results = new TransactionResults();
 
-            if (tpThisMs++ > tpMs) {
-
-                while (currentMs == System.currentTimeMillis()) {
-                    Thread.sleep(0, 50000);
-
-                }
-
-                sleepExtraMSIfNeeded(extraMs);
-
-                currentMs = System.currentTimeMillis();
-                tpThisMs = 0;
+        try {
+            for (TransactionResults threadResults : runInThreads(usableThreadCount, threadId -> () ->
+                    runTransactionWorker(threadId, usableThreadCount, userCount, tpMs, endtimeMs, mainClient, extraMs,
+                            progressCount))) {
+                results.add(threadResults);
             }
-
-            int randomuser = r.nextInt(userCount);
-
-            if (users[randomuser].isTxInFlight()) {
-                inFlightCount++;
-            } else {
-
-                users[randomuser].startTran();
-
-                if (users[randomuser].spendableBalance < 1000) {
-
-                    addCreditCount++;
-
-                    final long extraCredit = r.nextInt(1000) + 1000;
-
-                    final long startMs = System.currentTimeMillis();
-                    addCredit(mainClient, randomuser, extraCredit, users[randomuser]);
-                    shc.reportLatency(BaseChargingDemo.ADD_CREDIT, startMs, "ADD_CREDIT", 2000);
-                    shc.incCounter(BaseChargingDemo.ADD_CREDIT);
-                    users[randomuser].endTran();
-
-
-                } else {
-
-                    reportUsageCount++;
-
-                    int unitsUsed = (int) (users[randomuser].currentlyReserved * 0.9);
-                    int unitsWanted = r.nextInt(100);
-                    final long startMs = System.currentTimeMillis();
-                    reportQuotaUsage(mainClient, randomuser, unitsUsed,
-                            unitsWanted, users[randomuser].sessionId,
-                            "ReportQuotaUsage_" + pid + "_" + reportUsageCount + "_" + System.currentTimeMillis(), users[randomuser]);
-                    shc.reportLatency(BaseChargingDemo.REPORT_QUOTA_USAGE, startMs, "REPORT_QUOTA_USAGE", 2000);
-                    shc.incCounter(BaseChargingDemo.REPORT_QUOTA_USAGE);
-                    users[randomuser].endTran();
-
-                }
-            }
-
-            if (tranCount++ % 100000 == 0) {
-                msg("On transaction #" + tranCount);
-            }
-
-            // See if we need to do global queries...
-            if (lastGlobalQueryMs + (globalQueryFreqSeconds * 1000L) < System.currentTimeMillis()) {
-                lastGlobalQueryMs = System.currentTimeMillis();
-
-                queryUserAndStats(g, mainClient, (int) GENERIC_QUERY_USER_ID);
-
-            }
-
+        } finally {
+            globalQueries.shutdownNow();
         }
 
-        msg("finished adding transactions to queue");
-        msg("Queue drained");
-
         long elapsedTimeMs = System.currentTimeMillis() - startMsRun;
-        msg("Processed " + tranCount + " transactions in " + elapsedTimeMs + " milliseconds");
+        msg("Processed " + results.tranCount + " transactions in " + elapsedTimeMs + " milliseconds");
 
-        double tps = tranCount;
+        double tps = results.tranCount;
         tps = tps / (elapsedTimeMs / 1000d);
 
         msg("TPS = " + tps);
 
-        msg("Add Credit calls = " + addCreditCount);
-        msg("Report Usage calls = " + reportUsageCount);
-        msg("Skipped because transaction was in flight = " + inFlightCount);
+        msg("Add Credit calls = " + results.addCreditCount);
+        msg("Report Usage calls = " + results.reportUsageCount);
+        msg("Skipped because transaction was in flight = " + results.inFlightCount);
         msg("Retries caused by concurrent changes = " + shc.getCounter(GENERATION_CONFLICT));
 
         reportRunLatencyStats(tpMs, tps);
 
         // Declare victory if we got >= 90% of requested TPS...
         return tps / (tpMs * 1000) > .9;
+    }
+
+    /**
+     * One thread's share of the transaction benchmark. It owns every user whose id % threadCount == threadId,
+     * so no other thread in this process touches its users.
+     */
+    private static TransactionResults runTransactionWorker(int threadId, int threadCount, int userCount, int tpMs,
+                                                           long endtimeMs, IAerospikeClient mainClient, int extraMs,
+                                                           AtomicLong progressCount)
+            throws InterruptedException {
+
+        // Used to track changes and be unique when we are running multiple threads
+        final String txnPrefix = "ReportQuotaUsage_" + getPid() + "_" + threadId + "_";
+
+        Random r = new Random();
+
+        UserTransactionState[] users = new UserTransactionState[getThreadUserCount(userCount, threadCount, threadId)];
+
+        for (int i = 0; i < users.length; i++) {
+            // We don't know a users credit till we've spoken to the server, so
+            // we make an optimistic assumption...
+            users[i] = new UserTransactionState(i * threadCount + threadId, 2000);
+        }
+
+        TpMsThrottle throttle = new TpMsThrottle(getThreadTpMs(tpMs, threadCount, threadId), extraMs);
+        TransactionResults results = new TransactionResults();
+
+        while (endtimeMs > System.currentTimeMillis()) {
+
+            throttle.await();
+
+            UserTransactionState user = users[r.nextInt(users.length)];
+
+            if (user.isTxInFlight()) {
+                results.inFlightCount++;
+            } else {
+
+                user.startTran();
+
+                if (user.spendableBalance < 1000) {
+
+                    results.addCreditCount++;
+
+                    final long extraCredit = r.nextInt(1000) + 1000;
+
+                    final long startMs = System.currentTimeMillis();
+                    addCredit(mainClient, user.id, extraCredit, user);
+                    shc.reportLatency(BaseChargingDemo.ADD_CREDIT, startMs, "ADD_CREDIT", 2000);
+                    shc.incCounter(BaseChargingDemo.ADD_CREDIT);
+                    user.endTran();
+
+
+                } else {
+
+                    results.reportUsageCount++;
+
+                    int unitsUsed = (int) (user.currentlyReserved * 0.9);
+                    int unitsWanted = r.nextInt(100);
+                    final long startMs = System.currentTimeMillis();
+                    reportQuotaUsage(mainClient, user.id, unitsUsed, unitsWanted, user.sessionId,
+                            txnPrefix + results.reportUsageCount + "_" + System.currentTimeMillis(), user);
+                    shc.reportLatency(BaseChargingDemo.REPORT_QUOTA_USAGE, startMs, "REPORT_QUOTA_USAGE", 2000);
+                    shc.incCounter(BaseChargingDemo.REPORT_QUOTA_USAGE);
+                    user.endTran();
+
+                }
+            }
+
+            results.tranCount++;
+
+            long progress = progressCount.incrementAndGet();
+            if (progress % 100000 == 1) {
+                msg("On transaction #" + progress);
+            }
+
+        }
+
+        return results;
+    }
+
+    /**
+     * Counters from one KV benchmark thread
+     */
+    private static class KVResults {
+        long tranCount = 0;
+        long inFlightCount = 0;
+        long lockCount = 0;
+        long contestedLockCount = 0;
+        long lockFailCount = 0;
+        long fullUpdate = 0;
+        long deltaUpdate = 0;
+
+        void add(KVResults other) {
+            tranCount += other.tranCount;
+            inFlightCount += other.inFlightCount;
+            lockCount += other.lockCount;
+            contestedLockCount += other.contestedLockCount;
+            lockFailCount += other.lockFailCount;
+            fullUpdate += other.fullUpdate;
+            deltaUpdate += other.deltaUpdate;
+        }
+    }
+
+    /**
+     * Counters from one transaction benchmark thread
+     */
+    private static class TransactionResults {
+        long tranCount = 0;
+        long inFlightCount = 0;
+        long addCreditCount = 0;
+        long reportUsageCount = 0;
+
+        void add(TransactionResults other) {
+            tranCount += other.tranCount;
+            inFlightCount += other.inFlightCount;
+            addCreditCount += other.addCreditCount;
+            reportUsageCount += other.reportUsageCount;
+        }
     }
 
 
@@ -961,6 +1062,22 @@ public abstract class BaseChargingDemo {
      */
     private static long getNewLoyaltyCardNumber(Random r) {
         return System.currentTimeMillis() % 1000000;
+    }
+
+    /**
+     * Get the optional thread count argument.
+     *
+     * @param args  command line
+     * @param index where the thread count would be
+     * @return thread count, or the number of CPUs if not given
+     */
+    public static int getThreadCount(String[] args, int index) {
+
+        if (args.length > index) {
+            return Integer.parseInt(args[index]);
+        }
+
+        return Runtime.getRuntime().availableProcessors();
     }
 
     /**

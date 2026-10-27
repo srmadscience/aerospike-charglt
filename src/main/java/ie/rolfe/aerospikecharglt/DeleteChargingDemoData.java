@@ -31,8 +31,8 @@ public class DeleteChargingDemoData extends BaseChargingDemo {
 
         msg("Parameters:" + Arrays.toString(args));
 
-        if (args.length != 3) {
-            msg("Usage: hostnames recordcount tpms");
+        if (args.length != 3 && args.length != 4) {
+            msg("Usage: hostnames recordcount tpms [threads]");
             System.exit(1);
         }
 
@@ -45,12 +45,15 @@ public class DeleteChargingDemoData extends BaseChargingDemo {
         // Target transactions per millisecond.
         int tpMs = Integer.parseInt(args[2]);
 
+        // How many threads. Defaults to the number of CPUs.
+        int threadCount = getThreadCount(args, 3);
+
         try {
             try {
 
 
                 try (IAerospikeClient aerospikeClient = connect(hostlist)) {
-                    deleteAllUsers(aerospikeClient, recordCount, tpMs);
+                    deleteAllUsers(aerospikeClient, recordCount, tpMs, threadCount, getExtraMsIfSet());
                 }
                 msg("Closing connection...");
 

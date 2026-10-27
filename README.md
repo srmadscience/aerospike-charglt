@@ -43,10 +43,10 @@ Then, using `target/aerospike-charglt-1.0-SNAPSHOT-jar-with-dependencies.jar` as
 
 | Class | Parameters |
 |---|---|
-| `ie.rolfe.aerospikecharglt.CreateChargingDemoData` | hostnames recordcount tpms maxinitialcredit |
-| `ie.rolfe.aerospikecharglt.ChargingDemoTransactions` | hostnames recordcount tpms durationseconds queryseconds |
-| `ie.rolfe.aerospikecharglt.ChargingDemoKVStore` | hostnames recordcount tpms durationseconds queryseconds jsonsize deltaProportion |
-| `ie.rolfe.aerospikecharglt.DeleteChargingDemoData` | hostnames recordcount tpms |
+| `ie.rolfe.aerospikecharglt.CreateChargingDemoData` | hostnames recordcount tpms maxinitialcredit [threads] |
+| `ie.rolfe.aerospikecharglt.ChargingDemoTransactions` | hostnames recordcount tpms durationseconds queryseconds [threads] |
+| `ie.rolfe.aerospikecharglt.ChargingDemoKVStore` | hostnames recordcount tpms durationseconds queryseconds jsonsize deltaProportion [threads] |
+| `ie.rolfe.aerospikecharglt.DeleteChargingDemoData` | hostnames recordcount tpms [threads] |
 
 e.g.
 
@@ -55,6 +55,11 @@ e.g.
     java -cp $J ie.rolfe.aerospikecharglt.ChargingDemoTransactions localhost 100000 5 60 10
     java -cp $J ie.rolfe.aerospikecharglt.ChargingDemoKVStore localhost 100000 5 60 10 100 50
     java -cp $J ie.rolfe.aerospikecharglt.DeleteChargingDemoData localhost 100000 200
+
+`threads` defaults to the number of CPUs. Each thread owns the users where `id % threads == threadId`
+and gets an equal share of `tpms`, so threads never contend for the same user and share one
+thread-safe `AerospikeClient`. You can't have more threads than `tpms`, and the per-user soft locks and
+generation checks still protect against other client processes running at the same time.
 
 `hostnames` is a comma delimited list of `host[:port]`; the port defaults to 3000. Set `AEROSPIKE_NAMESPACE`
 to use a namespace other than `test`, and `EXTRA_MS` to slow things down on very slow hardware.
@@ -69,7 +74,7 @@ to use a namespace other than `test`, and `EXTRA_MS` to slow things down on very
 ## TODO
 
 * Feed to downstream systems
-* Make scale - currently is sync and one thread
+* Use the async client instead of sync calls on many threads
 
 ## Status
 
